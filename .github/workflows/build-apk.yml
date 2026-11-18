@@ -111,11 +111,51 @@ jobs:
       - name: دمج مصدر ضرغام كود
         run: python3 "$PROJ/tools/apply_overlay.py" "$RUNNER_TEMP/gen"
 
-      - name: ملاءمة الكود لنسخة llama.cpp
+      - name: ملاءمة الكود (llama.cpp وarm64 فقط)
         run: |
-          F="$RUNNER_TEMP/gen/android/app/src/main/cpp/llama_jni.cpp"
+          set -e
+          A="$RUNNER_TEMP/gen/android/app"
+          F="$A/src/main/cpp/llama_jni.cpp"
           sed -i '/mp\.use_mmap *= *true;/d' "$F"
-          grep -n "use_mmap" "$F" && exit 1 || echo "تم حذف use_mmap"
+          if grep -n "use_mmap" "$F"; then exit 1; fi
+          cat > "$A/src/main/cpp/CMakeLists.txt" <<'CMAKE_EOF'
+          cmake_minimum_required(VERSION 3.22.1)
+          project(llama_jni LANGUAGES C CXX)
+
+          # arm64 فقط. أي معمارية أخرى تبني مكتبة فارغة كي لا يفشل البناء.
+          if(NOT ANDROID_ABI STREQUAL "arm64-v8a")
+            file(WRITE ${CMAKE_BINARY_DIR}/stub.cpp "extern \"C\" void dirgham_stub() {}\n")
+            add_library(llama_jni SHARED ${CMAKE_BINARY_DIR}/stub.cpp)
+            return()
+          endif()
+
+          set(CMAKE_BUILD_TYPE Release)
+          set(CMAKE_CXX_STANDARD 17)
+
+          set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+          set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
+          set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+          set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+          set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+          set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
+          set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
+          set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+          set(GGML_CPU_ARM_ARCH "armv8.2-a+dotprod" CACHE STRING "" FORCE)
+
+          add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp ${CMAKE_CURRENT_BINARY_DIR}/llama.cpp)
+
+          add_library(llama_jni SHARED llama_jni.cpp)
+          target_include_directories(llama_jni PRIVATE
+              ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/include
+              ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/ggml/include)
+          target_link_libraries(llama_jni llama log android)
+          CMAKE_EOF
+          for G in "$A/build.gradle.kts" "$A/build.gradle"; do
+            [ -f "$G" ] || continue
+            sed -i 's|arguments("-DANDROID_STL=c++_shared", "-DGGML_NATIVE=OFF")|abiFilters("arm64-v8a")\n                arguments("-DANDROID_STL=c++_shared", "-DGGML_NATIVE=OFF")|' "$G"
+            sed -i 's|arguments "-DANDROID_STL=c++_shared", "-DGGML_NATIVE=OFF"|abiFilters "arm64-v8a"\n                arguments "-DANDROID_STL=c++_shared", "-DGGML_NATIVE=OFF"|' "$G"
+            echo "== $G =="; grep -n -B2 -A3 "abiFilters" "$G" || true
+          done
 
       - name: تثبيت الاعتماديات
         working-directory: ${{ runner.temp }}/gen
