@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       llama_ref:
-        description: "وسم llama.cpp (اتركه فارغًا لأحدث نسخة)"
+        description: "وسم llama.cpp (الافتراضي b11500)"
         required: false
         default: ""
 
@@ -73,26 +73,16 @@ jobs:
 
       - name: جلب llama.cpp
         env:
-          LLAMA_REF: ${{ github.event.inputs.llama_ref }}
-          LLAMA_SHA: 6f311d7ad63dce97a3ad1deaafb7cc044bb8c26c
+          LLAMA_REF: ${{ github.event.inputs.llama_ref || 'b11500' }}
         run: |
           set -e
           D="$RUNNER_TEMP/gen/android/app/src/main/cpp/llama.cpp"
           URL=https://github.com/ggml-org/llama.cpp.git
-          mkdir -p "$D"
-          if [ -n "$LLAMA_REF" ]; then
+          mkdir -p "$(dirname "$D")"
+          if ! git clone --depth 1 --branch "$LLAMA_REF" "$URL" "$D"; then
+            echo "::warning::تعذّر جلب الوسم $LLAMA_REF، سأجلب أحدث نسخة"
             rm -rf "$D"
-            git clone --depth 1 --branch "$LLAMA_REF" "$URL" "$D"
-          else
-            git -C "$D" init -q
-            git -C "$D" remote add origin "$URL"
-            if git -C "$D" fetch --depth 1 origin "$LLAMA_SHA"; then
-              git -C "$D" checkout -q FETCH_HEAD
-            else
-              echo "::warning::تعذّر جلب النسخة المثبّتة، سأجلب أحدث نسخة"
-              rm -rf "$D"
-              git clone --depth 1 "$URL" "$D"
-            fi
+            git clone --depth 1 "$URL" "$D"
           fi
           git -C "$D" log -1 --format='llama.cpp commit: %H %cd'
           rm -rf "$D/.git"
@@ -104,58 +94,12 @@ jobs:
                    llama_tokenize llama_init_from_model llama_free llama_decode llama_batch_get_one \
                    llama_sampler_chain_init llama_sampler_init_top_k llama_sampler_init_top_p \
                    llama_sampler_init_temp llama_sampler_init_dist llama_sampler_sample \
-                   llama_vocab_is_eog llama_token_to_piece; do
+                   llama_vocab_is_eog llama_token_to_piece llama_model_chat_template llama_chat_apply_template llama_print_system_info; do
             if grep -q "$f" "$H"; then echo "موجودة  $f"; else echo "::warning::مفقودة في llama.h: $f"; fi
           done
 
       - name: دمج مصدر ضرغام كود
         run: python3 "$PROJ/tools/apply_overlay.py" "$RUNNER_TEMP/gen"
-
-      - name: ملاءمة الكود (llama.cpp وarm64 فقط)
-        run: |
-          set -e
-          A="$RUNNER_TEMP/gen/android/app"
-          F="$A/src/main/cpp/llama_jni.cpp"
-          sed -i '/mp\.use_mmap *= *true;/d' "$F"
-          if grep -n "use_mmap" "$F"; then exit 1; fi
-          cat > "$A/src/main/cpp/CMakeLists.txt" <<'CMAKE_EOF'
-          cmake_minimum_required(VERSION 3.22.1)
-          project(llama_jni LANGUAGES C CXX)
-
-          # arm64 فقط. أي معمارية أخرى تبني مكتبة فارغة كي لا يفشل البناء.
-          if(NOT ANDROID_ABI STREQUAL "arm64-v8a")
-            file(WRITE ${CMAKE_BINARY_DIR}/stub.cpp "extern \"C\" void dirgham_stub() {}\n")
-            add_library(llama_jni SHARED ${CMAKE_BINARY_DIR}/stub.cpp)
-            return()
-          endif()
-
-          set(CMAKE_BUILD_TYPE Release)
-          set(CMAKE_CXX_STANDARD 17)
-
-          set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-          set(LLAMA_BUILD_COMMON OFF CACHE BOOL "" FORCE)
-          set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-          set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-          set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
-          set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
-          set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
-          set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
-          set(GGML_CPU_ARM_ARCH "armv8.2-a+dotprod" CACHE STRING "" FORCE)
-
-          add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp ${CMAKE_CURRENT_BINARY_DIR}/llama.cpp)
-
-          add_library(llama_jni SHARED llama_jni.cpp)
-          target_include_directories(llama_jni PRIVATE
-              ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/include
-              ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/ggml/include)
-          target_link_libraries(llama_jni llama log android)
-          CMAKE_EOF
-          for G in "$A/build.gradle.kts" "$A/build.gradle"; do
-            [ -f "$G" ] || continue
-            sed -i 's|arguments("-DANDROID_STL=c++_shared", "-DGGML_NATIVE=OFF")|abiFilters("arm64-v8a")\n                arguments("-DANDROID_STL=c++_shared", "-DGGML_NATIVE=OFF")|' "$G"
-            sed -i 's|arguments "-DANDROID_STL=c++_shared", "-DGGML_NATIVE=OFF"|abiFilters "arm64-v8a"\n                arguments "-DANDROID_STL=c++_shared", "-DGGML_NATIVE=OFF"|' "$G"
-            echo "== $G =="; grep -n -B2 -A3 "abiFilters" "$G" || true
-          done
 
       - name: تثبيت الاعتماديات
         working-directory: ${{ runner.temp }}/gen
