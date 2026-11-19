@@ -10,69 +10,121 @@ on:
   workflow_dispatch:
     inputs:
       llama_ref:
-        description: "نسخة llama.cpp"
+        description: "وسم llama.cpp المتوافق مع المشروع"
         required: false
         default: "b11500"
+        type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: dirgham-android-build
+  group: dirgham-apk-build
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build Android APK
+    name: Build Dirgham Android APK
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
     steps:
-      - name: تحميل المستودع
+
+      # ==========================================
+      # 1. تحميل المستودع
+      # ==========================================
+
+      - name: تحميل ملفات المستودع
         uses: actions/checkout@v4
 
-      - name: تحديد مصدر المشروع
+      - name: عرض معلومات البيئة
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "========== SYSTEM =========="
+          uname -a
+          echo
+          echo "========== REPOSITORY =========="
+          ls -lah
+
+      # ==========================================
+      # 2. اكتشاف مصدر المشروع
+      # ==========================================
+
+      - name: تحديد مصدر ضرغام كود
         shell: bash
         run: |
           set -euo pipefail
 
           PROJ=""
 
-          # البحث عن ملفات المشروع المرفوعة مباشرة
-          S=$(find . -type f -name apply_overlay.py \
-            -not -path './.git/*' | head -n 1 || true)
+          echo "البحث عن ملفات المشروع..."
+
+          # الحالة الأولى: ملفات المشروع موجودة مباشرة
+          S=$(find . -type f \
+            -path '*/tools/apply_overlay.py' \
+            -not -path '*/.git/*' | head -n 1 || true)
 
           if [ -n "$S" ]; then
             PROJ=$(cd "$(dirname "$S")/.." && pwd)
+            echo "تم العثور على ملفات المشروع مباشرة."
+
           else
-            # البحث عن الملف المضغوط
-            Z=$(find . -maxdepth 4 -type f \
+            # الحالة الثانية: المشروع داخل ZIP
+            Z=$(find . -maxdepth 5 -type f \
               -iname '*.zip' | head -n 1 || true)
 
             if [ -z "$Z" ]; then
-              echo "::error::لم يتم العثور على ملف المشروع ZIP"
+              echo "::error::لم أجد ملف ZIP أو ملفات المشروع."
               exit 1
             fi
 
-            mkdir -p "$RUNNER_TEMP/source"
-            unzip -q -o "$Z" -d "$RUNNER_TEMP/source"
+            echo "ملف المشروع: $Z"
 
-            S=$(find "$RUNNER_TEMP/source" \
-              -type f -name apply_overlay.py | head -n 1 || true)
+            mkdir -p "$RUNNER_TEMP/unpacked"
 
-            if [ -n "$S" ]; then
-              PROJ=$(cd "$(dirname "$S")/.." && pwd)
+            unzip -q -o "$Z" \
+              -d "$RUNNER_TEMP/unpacked"
+
+            S=$(find "$RUNNER_TEMP/unpacked" \
+              -type f \
+              -path '*/tools/apply_overlay.py' \
+              | head -n 1 || true)
+
+            if [ -z "$S" ]; then
+              echo "::error::لم يتم العثور على apply_overlay.py"
+              exit 1
             fi
+
+            PROJ=$(cd "$(dirname "$S")/.." && pwd)
           fi
 
-          if [ -z "$PROJ" ] || \
-             [ ! -f "$PROJ/app_src/pubspec.yaml" ]; then
-            echo "::error::بنية المشروع غير مكتملة"
-            exit 1
-          fi
+          # التحقق من الملفات الأساسية
+          REQUIRED=(
+            "app_src/pubspec.yaml"
+            "app_src/lib/main.dart"
+            "app_src/android_overlay/cpp/CMakeLists.txt"
+            "app_src/android_overlay/cpp/llama_jni.cpp"
+            "tools/apply_overlay.py"
+          )
+
+          for FILE in "${REQUIRED[@]}"; do
+            if [ ! -f "$PROJ/$FILE" ]; then
+              echo "::error::ملف مفقود: $FILE"
+              exit 1
+            fi
+            echo "OK: $FILE"
+          done
 
           echo "PROJ=$PROJ" >> "$GITHUB_ENV"
-          echo "تم العثور على المشروع: $PROJ"
+
+          echo "========== PROJECT =========="
+          echo "$PROJ"
+          du -sh "$PROJ"
+
+      # ==========================================
+      # 3. إعداد Java و Flutter
+      # ==========================================
 
       - name: إعداد Java 17
         uses: actions/setup-java@v4
@@ -86,65 +138,362 @@ jobs:
           channel: stable
           cache: true
 
-      - name: تجهيز Android SDK
+      - name: فحص إصدارات أدوات البناء
         shell: bash
         run: |
+          set -euo pipefail
+
+          java -version
+          flutter --version
+          dart --version
+
+          echo "ANDROID_HOME=$ANDROID_HOME"
+
+      # ==========================================
+      # 4. إعداد Android SDK و CMake
+      # ==========================================
+
+      - name: تجهيز أدوات Android
+        shell: bash
+        run: |
+          set -euo pipefail
+
           yes | flutter doctor --android-licenses \
             >/dev/null 2>&1 || true
 
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
-            "cmake;3.22.1" >/dev/null 2>&1 || true
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
+          if [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::Android sdkmanager غير موجود"
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --licenses \
+            >/dev/null 2>&1 || true
+
+          "$SDKMANAGER" --install \
+            "platform-tools" \
+            "cmake;3.22.1"
+
+          echo "تم تجهيز أدوات Android و CMake."
+
+      # ==========================================
+      # 5. إنشاء هيكل Flutter Android
+      # ==========================================
 
       - name: إنشاء مشروع Android
+        shell: bash
         run: |
+          set -euo pipefail
+
           flutter create \
             --org com.dirgham \
             --project-name dirgham_code \
             --platforms android \
             "$RUNNER_TEMP/gen"
 
-      - name: تحميل llama.cpp
-        env:
-          LLAMA_REF: ${{ github.event.inputs.llama_ref || 'b11500' }}
+          test -f "$RUNNER_TEMP/gen/android/settings.gradle.kts" \
+            || test -f "$RUNNER_TEMP/gen/android/settings.gradle"
+
+      # ==========================================
+      # 6. إصلاح مستودعات Gradle
+      # ==========================================
+
+      - name: إصلاح مستودعات Gradle
+        shell: bash
         run: |
           set -euo pipefail
 
-          DEST="$RUNNER_TEMP/gen/android/app/src/main/cpp/llama.cpp"
+          python3 - "$RUNNER_TEMP/gen/android" <<'PY'
+          import re
+          import sys
+          from pathlib import Path
 
-          mkdir -p "$(dirname "$DEST")"
+          root = Path(sys.argv[1])
+
+          settings = next(
+              (p for p in [
+                  root / "settings.gradle.kts",
+                  root / "settings.gradle"
+              ] if p.exists()),
+              None
+          )
+
+          if settings is None:
+              raise SystemExit("لم أجد ملف settings.gradle")
+
+          text = settings.read_text(encoding="utf-8")
+
+          def patch_repositories(source, owner, required):
+              owner_match = re.search(
+                  rf"\b{owner}\s*\{{", source
+              )
+
+              if not owner_match:
+                  return source
+
+              repo_match = re.search(
+                  r"\brepositories\s*\{",
+                  source[owner_match.end():]
+              )
+
+              if not repo_match:
+                  raise SystemExit(
+                      f"لم أجد repositories داخل {owner}"
+                  )
+
+              start = owner_match.end() + repo_match.start()
+              brace = source.find("{", start)
+
+              depth = 0
+              end = None
+
+              for i in range(brace, len(source)):
+                  if source[i] == "{":
+                      depth += 1
+                  elif source[i] == "}":
+                      depth -= 1
+                      if depth == 0:
+                          end = i
+                          break
+
+              if end is None:
+                  raise SystemExit(
+                      f"قوس غير مكتمل داخل {owner}"
+                  )
+
+              body = source[brace + 1:end]
+
+              missing = [
+                  item for item in required
+                  if not re.search(
+                      rf"(?m)^\s*{re.escape(item)}\s*$",
+                      body
+                  )
+              ]
+
+              if missing:
+                  body = "\n" + "\n".join(
+                      "        " + item for item in missing
+                  ) + body
+
+              return (
+                  source[:brace + 1]
+                  + body
+                  + source[end:]
+              )
+
+          text = patch_repositories(
+              text,
+              "pluginManagement",
+              [
+                  "google()",
+                  "mavenCentral()",
+                  "gradlePluginPortal()"
+              ]
+          )
+
+          text = patch_repositories(
+              text,
+              "dependencyResolutionManagement",
+              [
+                  "google()",
+                  "mavenCentral()"
+              ]
+          )
+
+          settings.write_text(text, encoding="utf-8")
+
+          print("========== GRADLE SETTINGS ==========")
+          print(text)
+          PY
+
+      # ==========================================
+      # 7. تحميل llama.cpp
+      # ==========================================
+
+      - name: تحميل llama.cpp
+        env:
+          LLAMA_REF: ${{ github.event.inputs.llama_ref || 'b11500' }}
+
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          D="$RUNNER_TEMP/gen/android/app/src/main/cpp/llama.cpp"
+
+          URL="https://github.com/ggml-org/llama.cpp.git"
+
+          echo "نسخة llama.cpp المطلوبة: $LLAMA_REF"
+
+          mkdir -p "$(dirname "$D")"
 
           git clone \
             --depth 1 \
+            --recurse-submodules \
+            --shallow-submodules \
             --branch "$LLAMA_REF" \
-            https://github.com/ggml-org/llama.cpp.git \
-            "$DEST"
+            "$URL" \
+            "$D"
 
-          git -C "$DEST" log -1 --format='llama.cpp: %H'
+          if [ ! -f "$D/CMakeLists.txt" ]; then
+            echo "::error::ملف CMakeLists.txt غير موجود"
+            exit 1
+          fi
 
-          rm -rf "$DEST/.git"
+          if [ ! -f "$D/include/llama.h" ]; then
+            echo "::error::ملف llama.h غير موجود"
+            exit 1
+          fi
 
-      - name: دمج ملفات ضرغام كود
+          if [ ! -f "$D/ggml/CMakeLists.txt" ]; then
+            echo "::error::مجلد ggml غير مكتمل"
+            exit 1
+          fi
+
+          echo "========== LLAMA VERSION =========="
+
+          git -C "$D" rev-parse HEAD
+          git -C "$D" describe --tags --always
+
+          echo "========== SUBMODULES =========="
+
+          git -C "$D" submodule status
+
+          # مهم جدًا:
+          # لا تحذف مجلد .git
+          # يحتاج CMake إلى معلومات Git أثناء البناء.
+
+          echo "تم تحميل llama.cpp مع الاحتفاظ ببيانات Git."
+
+      # ==========================================
+      # 8. فحص إعدادات C++
+      # ==========================================
+
+      - name: فحص ملفات C++ و CMake
+        shell: bash
         run: |
+          set -euo pipefail
+
+          CPP="$PROJ/app_src/android_overlay/cpp"
+
+          echo "========== CMAKE =========="
+
+          cat "$CPP/CMakeLists.txt"
+
+          echo "========== JNI =========="
+
+          grep -n "llama_" "$CPP/llama_jni.cpp" | head -n 60
+
+          echo "========== LLAMA HEADER =========="
+
+          test -f "$RUNNER_TEMP/gen/android/app/src/main/cpp/llama.cpp/include/llama.h"
+
+          echo "ملفات C++ الأساسية موجودة."
+
+      # ==========================================
+      # 9. دمج ملفات ضرغام كود
+      # ==========================================
+
+      - name: دمج مصدر ضرغام كود
+        shell: bash
+        run: |
+          set -euo pipefail
+
           python3 "$PROJ/tools/apply_overlay.py" \
             "$RUNNER_TEMP/gen"
 
-      - name: تثبيت مكتبات Flutter
-        working-directory: ${{ runner.temp }}/gen
-        run: flutter pub get
+          echo "========== MERGED PROJECT =========="
 
-      - name: فحص Flutter
+          test -f "$RUNNER_TEMP/gen/pubspec.yaml"
+
+          test -f "$RUNNER_TEMP/gen/android/app/src/main/cpp/CMakeLists.txt"
+
+          test -f "$RUNNER_TEMP/gen/android/app/src/main/cpp/llama_jni.cpp"
+
+          test -d "$RUNNER_TEMP/gen/android/app/src/main/cpp/llama.cpp"
+
+          echo "تم دمج المشروع بنجاح."
+
+      # ==========================================
+      # 10. تثبيت مكتبات Flutter
+      # ==========================================
+
+      - name: تثبيت اعتماديات Flutter
         working-directory: ${{ runner.temp }}/gen
-        run: flutter analyze --no-pub
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          flutter pub get
+
+          echo "========== DEPENDENCIES =========="
+
+          flutter pub deps --style=compact
+
+      # ==========================================
+      # 11. تحليل الكود
+      # ==========================================
+
+      - name: تحليل Flutter
+        working-directory: ${{ runner.temp }}/gen
+        shell: bash
+        run: |
+          flutter analyze --no-pub \
+            || echo "::warning::توجد ملاحظات تحليل Flutter، وسيستمر اختبار البناء."
+
         continue-on-error: true
 
-      - name: بناء APK Release
+      # ==========================================
+      # 12. بناء APK
+      # ==========================================
+
+      - name: بناء APK Release ARM64
         working-directory: ${{ runner.temp }}/gen
+        shell: bash
         run: |
+          set -o pipefail
+
           flutter build apk \
             --release \
-            --target-platform android-arm64
+            --target-platform android-arm64 \
+            --verbose \
+            2>&1 | tee "$RUNNER_TEMP/build.log"
+
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+
+          if [ ! -s "$APK" ]; then
+            echo "::error::لم يتم إنشاء ملف APK"
+            exit 1
+          fi
+
+          echo "========== APK INFORMATION =========="
+
+          ls -lh "$APK"
+          sha256sum "$APK"
+
+      # ==========================================
+      # 13. رفع سجل الأخطاء
+      # ==========================================
+
+      - name: حفظ سجلات البناء عند الفشل
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dirgham-build-diagnostics
+          path: |
+            ${{ runner.temp }}/build.log
+            ${{ runner.temp }}/gen/android/app/.cxx/**
+            ${{ runner.temp }}/gen/build/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # ==========================================
+      # 14. رفع APK
+      # ==========================================
 
       - name: رفع APK إلى Artifacts
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: dirgham-code-apk
@@ -152,21 +501,22 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: نشر APK في Releases
+      # ==========================================
+      # 15. نشر الإصدار
+      # ==========================================
+
+      - name: نشر APK في GitHub Releases
         if: success()
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}-${{ github.run_attempt }}
           name: ضرغام كود - بناء ${{ github.run_number }}
+          body: |
+            تم بناء تطبيق ضرغام كود تلقائيًا.
+
+            Architecture: ARM64
+            Build: Release
+            Engine: llama.cpp
           files: ${{ runner.temp }}/gen/build/app/outputs/flutter-apk/app-release.apk
           fail_on_unmatched_files: true
-
-      - name: رفع سجل الأخطاء
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dirgham-build-error-log
-          path: |
-            ${{ runner.temp }}/build.log
-            ${{ runner.temp }}/gen/build/reports/
-          if-no-files-found: ignore
+          make_latest: true
