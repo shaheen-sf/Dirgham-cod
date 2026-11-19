@@ -85,7 +85,6 @@ jobs:
           fi
           git -C "$D" log -1 --format='llama.cpp commit: %H %cd'
           rm -rf "$D/.git"
-          # توحيد الطوابع الزمنية كي لا يرى ninja ملفًا "أحدث" من build.ninja
           find "$D" -exec touch -h -d "2020-01-01 00:00:00" {} +
 
       - name: فحص واجهة llama.cpp
@@ -112,7 +111,7 @@ jobs:
         working-directory: ${{ runner.temp }}/gen
         run: |
           set -o pipefail
-          flutter build apk --release --target-platform android-arm64 2>&1 | tee "$RUNNER_TEMP/build.log"
+          flutter build apk --release --target-platform android-arm64 --build-number "$((100 + ${{ github.run_number }}))" 2>&1 | tee "$RUNNER_TEMP/build.log"
 
       - name: رفع سجل البناء عند الفشل
         if: failure()
