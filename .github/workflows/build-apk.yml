@@ -103,6 +103,26 @@ jobs:
           python3 "$PROJ/tools/apply_overlay.py" "$RUNNER_TEMP/gen"
           grep -n "SUPPRESS_REGENERATION" "$RUNNER_TEMP/gen/android/app/src/main/cpp/CMakeLists.txt"
 
+      - name: جلب خط المسند (حروف حقيقية للخلفية)
+        run: |
+          F="$RUNNER_TEMP/gen/assets/musnad.ttf"
+          mkdir -p "$(dirname "$F")"
+          ok() { [ -s "$F" ] && [ "$(stat -c%s "$F")" -gt 10000 ] && head -c4 "$F" | od -An -tx1 | tr -d ' \n' | grep -qE '^(00010000|74727565|4f54544f)$'; }
+          for U in \
+            "https://github.com/notofonts/notofonts.github.io/raw/main/fonts/NotoSansSouthArabian/hinted/ttf/NotoSansSouthArabian-Regular.ttf" \
+            "https://github.com/notofonts/notofonts.github.io/raw/main/fonts/NotoSansSouthArabian/unhinted/ttf/NotoSansSouthArabian-Regular.ttf" \
+            "https://github.com/google/fonts/raw/main/ofl/notosanssoutharabian/NotoSansSouthArabian-Regular.ttf"; do
+            ok && break
+            echo "جلب: $U"; curl -fsSL --retry 3 -o "$F" "$U" || rm -f "$F"
+          done
+          if ! ok; then
+            echo "تعذّر التنزيل المباشر، سأثبّت حزمة الخطوط"
+            sudo apt-get install -y --no-install-recommends fonts-noto-core >/dev/null 2>&1 || true
+            S=$(find /usr/share/fonts -name 'NotoSansSouthArabian-Regular.ttf' 2>/dev/null | head -n1)
+            [ -n "$S" ] && cp "$S" "$F"
+          fi
+          if ok; then echo "خط المسند جاهز: $(stat -c%s "$F") بايت"; else rm -f "$F"; echo "::warning::لم أحصل على خط المسند؛ ستظهر النقوش الهندسية فقط"; fi
+
       - name: تثبيت الاعتماديات
         working-directory: ${{ runner.temp }}/gen
         run: flutter pub get
