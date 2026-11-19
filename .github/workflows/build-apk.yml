@@ -1,133 +1,172 @@
-name: بناء APK
+
+name: بناء تطبيق ضرغام كود APK
 
 on:
   push:
-    branches: [main, master]
+    branches:
+      - main
+      - master
+
   workflow_dispatch:
     inputs:
       llama_ref:
-        description: "وسم llama.cpp (الافتراضي b11500)"
+        description: "نسخة llama.cpp"
         required: false
-        default: ""
+        default: "b11500"
 
 permissions:
   contents: write
 
 concurrency:
-  group: build-apk
+  group: dirgham-android-build
   cancel-in-progress: true
 
 jobs:
   build:
+    name: Build Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
+
     steps:
-      - name: سحب المشروع
+      - name: تحميل المستودع
         uses: actions/checkout@v4
 
-      # يعمل في الحالات الثلاث: مجلدات مرفوعة في الجذر، أو داخل مجلد فرعي، أو zip غير مفكوك
-      - name: تحديد مكان مصدر ضرغام كود
+      - name: تحديد مصدر المشروع
+        shell: bash
         run: |
-          set -e
-          echo "== محتوى المستودع =="; ls -A
+          set -euo pipefail
+
           PROJ=""
-          S=$(find . -type f -name apply_overlay.py -path '*tools*' -not -path './app/*' | head -n1 || true)
+
+          # البحث عن ملفات المشروع المرفوعة مباشرة
+          S=$(find . -type f -name apply_overlay.py \
+            -not -path './.git/*' | head -n 1 || true)
+
           if [ -n "$S" ]; then
             PROJ=$(cd "$(dirname "$S")/.." && pwd)
           else
-            Z=$(find . -maxdepth 3 -type f -iname '*.zip' | head -n1 || true)
-            if [ -n "$Z" ]; then
-              echo "فك الضغط: $Z"
-              mkdir -p "$RUNNER_TEMP/unz"
-              unzip -q -o "$Z" -d "$RUNNER_TEMP/unz"
-              S=$(find "$RUNNER_TEMP/unz" -type f -name apply_overlay.py | head -n1 || true)
-              [ -n "$S" ] && PROJ=$(cd "$(dirname "$S")/.." && pwd)
+            # البحث عن الملف المضغوط
+            Z=$(find . -maxdepth 4 -type f \
+              -iname '*.zip' | head -n 1 || true)
+
+            if [ -z "$Z" ]; then
+              echo "::error::لم يتم العثور على ملف المشروع ZIP"
+              exit 1
+            fi
+
+            mkdir -p "$RUNNER_TEMP/source"
+            unzip -q -o "$Z" -d "$RUNNER_TEMP/source"
+
+            S=$(find "$RUNNER_TEMP/source" \
+              -type f -name apply_overlay.py | head -n 1 || true)
+
+            if [ -n "$S" ]; then
+              PROJ=$(cd "$(dirname "$S")/.." && pwd)
             fi
           fi
-          if [ -z "$PROJ" ] || [ ! -f "$PROJ/app_src/pubspec.yaml" ]; then
-            echo "::error::لم أجد tools/apply_overlay.py و app_src. ارفع محتويات الـ zip (أو الـ zip نفسه) إلى المستودع."
+
+          if [ -z "$PROJ" ] || \
+             [ ! -f "$PROJ/app_src/pubspec.yaml" ]; then
+            echo "::error::بنية المشروع غير مكتملة"
             exit 1
           fi
-          echo "PROJ=$PROJ" >> "$GITHUB_ENV"
-          echo "مصدر المشروع: $PROJ"; ls -A "$PROJ"
 
-      - name: Java 17
+          echo "PROJ=$PROJ" >> "$GITHUB_ENV"
+          echo "تم العثور على المشروع: $PROJ"
+
+      - name: إعداد Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - name: Flutter
+      - name: إعداد Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
-      - name: تجهيز أدوات أندرويد
+      - name: تجهيز Android SDK
+        shell: bash
         run: |
-          yes | flutter doctor --android-licenses >/dev/null 2>&1 || true
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "cmake;3.22.1" >/dev/null 2>&1 || true
+          yes | flutter doctor --android-licenses \
+            >/dev/null 2>&1 || true
 
-      - name: توليد هيكل أندرويد
-        run: flutter create --org com.dirgham --project-name dirgham_code --platforms android "$RUNNER_TEMP/gen"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "cmake;3.22.1" >/dev/null 2>&1 || true
 
-      - name: جلب llama.cpp
+      - name: إنشاء مشروع Android
+        run: |
+          flutter create \
+            --org com.dirgham \
+            --project-name dirgham_code \
+            --platforms android \
+            "$RUNNER_TEMP/gen"
+
+      - name: تحميل llama.cpp
         env:
           LLAMA_REF: ${{ github.event.inputs.llama_ref || 'b11500' }}
         run: |
-          set -e
-          D="$RUNNER_TEMP/gen/android/app/src/main/cpp/llama.cpp"
-          URL=https://github.com/ggml-org/llama.cpp.git
-          mkdir -p "$(dirname "$D")"
-          if ! git clone --depth 1 --branch "$LLAMA_REF" "$URL" "$D"; then
-            echo "::warning::تعذّر جلب الوسم $LLAMA_REF، سأجلب أحدث نسخة"
-            rm -rf "$D"
-            git clone --depth 1 "$URL" "$D"
-          fi
-          git -C "$D" log -1 --format='llama.cpp commit: %H %cd'
-          rm -rf "$D/.git"
+          set -euo pipefail
 
-      - name: فحص واجهة llama.cpp
+          DEST="$RUNNER_TEMP/gen/android/app/src/main/cpp/llama.cpp"
+
+          mkdir -p "$(dirname "$DEST")"
+
+          git clone \
+            --depth 1 \
+            --branch "$LLAMA_REF" \
+            https://github.com/ggml-org/llama.cpp.git \
+            "$DEST"
+
+          git -C "$DEST" log -1 --format='llama.cpp: %H'
+
+          rm -rf "$DEST/.git"
+
+      - name: دمج ملفات ضرغام كود
         run: |
-          H="$RUNNER_TEMP/gen/android/app/src/main/cpp/llama.cpp/include/llama.h"
-          for f in llama_backend_init llama_model_load_from_file llama_model_free llama_model_get_vocab \
-                   llama_tokenize llama_init_from_model llama_free llama_decode llama_batch_get_one \
-                   llama_sampler_chain_init llama_sampler_init_top_k llama_sampler_init_top_p \
-                   llama_sampler_init_temp llama_sampler_init_dist llama_sampler_sample \
-                   llama_vocab_is_eog llama_token_to_piece llama_model_chat_template llama_chat_apply_template llama_print_system_info; do
-            if grep -q "$f" "$H"; then echo "موجودة  $f"; else echo "::warning::مفقودة في llama.h: $f"; fi
-          done
+          python3 "$PROJ/tools/apply_overlay.py" \
+            "$RUNNER_TEMP/gen"
 
-      - name: دمج مصدر ضرغام كود
-        run: python3 "$PROJ/tools/apply_overlay.py" "$RUNNER_TEMP/gen"
-
-      - name: تثبيت الاعتماديات
+      - name: تثبيت مكتبات Flutter
         working-directory: ${{ runner.temp }}/gen
         run: flutter pub get
 
-      - name: بناء APK (arm64)
+      - name: فحص Flutter
+        working-directory: ${{ runner.temp }}/gen
+        run: flutter analyze --no-pub
+        continue-on-error: true
+
+      - name: بناء APK Release
         working-directory: ${{ runner.temp }}/gen
         run: |
-          set -o pipefail
-          flutter build apk --release --target-platform android-arm64 2>&1 | tee "$RUNNER_TEMP/build.log"
+          flutter build apk \
+            --release \
+            --target-platform android-arm64
 
-      - name: رفع سجل البناء عند الفشل
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: ${{ runner.temp }}/build.log
-          if-no-files-found: ignore
-
-      - name: حفظ الـ APK كملف مرفق
+      - name: رفع APK إلى Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: dirgham-code-apk
           path: ${{ runner.temp }}/gen/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
 
-      - name: نشر الـ APK في صفحة Releases
+      - name: نشر APK في Releases
+        if: success()
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ github.run_number }}
+          tag_name: build-${{ github.run_number }}-${{ github.run_attempt }}
           name: ضرغام كود - بناء ${{ github.run_number }}
           files: ${{ runner.temp }}/gen/build/app/outputs/flutter-apk/app-release.apk
+          fail_on_unmatched_files: true
+
+      - name: رفع سجل الأخطاء
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dirgham-build-error-log
+          path: |
+            ${{ runner.temp }}/build.log
+            ${{ runner.temp }}/gen/build/reports/
+          if-no-files-found: ignore
